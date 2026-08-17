@@ -5,7 +5,7 @@ name: Agentic Test Pipeline
 #   2. authoring - author + export up to max_tests_to_author of the generated *_test.md files as
 #                  standalone Playwright code (kane-cli testmd run --code-export)
 #   3. execution - re-run the same selected tests as one bundled LambdaTest test run
-#                  (kane-cli testrun run) and produce a build view
+#                  (kane-cli testrun run) and publish a job summary
 #
 # Note on execution: it re-runs the *_test.md files via `kane-cli testrun run` rather than
 # executing the exported Playwright file directly (e.g. `node test.js`). The exported file
@@ -13,10 +13,17 @@ name: Agentic Test Pipeline
 # rejected by LambdaTest with "Test case validation failed: bad request" - that combination is
 # only valid inside a fresh kane-cli-managed session, not a bare CDP replay. kane-cli's own
 # testmd/testrun commands create a new session each time and are the mechanism proven to
-# actually reach LambdaTest and produce a build/share_url. `testrun run` additionally requires
-# each member to already have local meta from a prior `testmd run` (else it's skipped as
-# "missing_meta"), which is why authoring's full .testmuai/tests state - not just the bare
-# *_test.md files - is carried forward into this job.
+# actually reach LambdaTest. `testrun run` additionally requires each member to already have
+# local meta from a prior `testmd run` (else it's skipped as "missing_meta"), which is why
+# authoring's full .testmuai/tests state - not just the bare *_test.md files - is carried
+# forward into this job. IMPORTANT: unlike `testmd run`, `testrun run` never returns a hosted
+# LambdaTest dashboard link (public or private) - only a local evidence pack - so the job
+# summary reports pass/fail per test plus that evidence pack (uploaded as an artifact), not a
+# clickable Test Manager URL.
+#
+# kane_project_id / kane_folder_id inputs: passed to `kane-cli login --project-id/--folder-id`
+# in every job when set; left blank, kane-cli auto-selects the authenticated account's default
+# project/folder (same behavior as a plain `kane-cli login` with no such flags).
 #
 # Works two ways:
 #   - Directly in this repo: Actions tab > "Agentic Test Pipeline" > Run workflow, optionally
@@ -63,6 +70,14 @@ on:
         required: false
         default: 0
         type: number
+      kane_project_id:
+        description: "kane-cli/LambdaTest project ID (blank = account default, same as a plain kane-cli login)"
+        required: false
+        default: ""
+      kane_folder_id:
+        description: "kane-cli/LambdaTest folder ID within the project (blank = account default)"
+        required: false
+        default: ""
   workflow_call:
     inputs:
       requirements_doc:
@@ -81,6 +96,14 @@ on:
         type: number
         required: false
         default: 0
+      kane_project_id:
+        type: string
+        required: false
+        default: ""
+      kane_folder_id:
+        type: string
+        required: false
+        default: ""
     secrets:
       KANE_USERNAME:
         required: true
@@ -107,7 +130,17 @@ jobs:
 
       - name: Authenticate kane-cli
         run: |
-          kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          # Blank project/folder ID = let kane-cli auto-select the account default (same
+          # as a plain `kane-cli login` with no --project-id/--folder-id).
+          if [ -n "${{ inputs.kane_project_id }}" ]; then
+            args+=(--project-id "${{ inputs.kane_project_id }}")
+          fi
+          if [ -n "${{ inputs.kane_folder_id }}" ]; then
+            args+=(--folder-id "${{ inputs.kane_folder_id }}")
+          fi
+          kane-cli login "${args[@]}"
 
       - name: Resolve requirements document
         id: resolve
@@ -174,7 +207,17 @@ jobs:
 
       - name: Authenticate kane-cli
         run: |
-          kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          # Blank project/folder ID = let kane-cli auto-select the account default (same
+          # as a plain `kane-cli login` with no --project-id/--folder-id).
+          if [ -n "${{ inputs.kane_project_id }}" ]; then
+            args+=(--project-id "${{ inputs.kane_project_id }}")
+          fi
+          if [ -n "${{ inputs.kane_folder_id }}" ]; then
+            args+=(--folder-id "${{ inputs.kane_folder_id }}")
+          fi
+          kane-cli login "${args[@]}"
 
       - name: Select tests to author (respecting max_tests_to_author)
         id: select
@@ -262,25 +305,90 @@ jobs:
 
       - name: Authenticate kane-cli
         run: |
-          kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          # Blank project/folder ID = let kane-cli auto-select the account default (same
+          # as a plain `kane-cli login` with no --project-id/--folder-id).
+          if [ -n "${{ inputs.kane_project_id }}" ]; then
+            args+=(--project-id "${{ inputs.kane_project_id }}")
+          fi
+          if [ -n "${{ inputs.kane_folder_id }}" ]; then
+            args+=(--folder-id "${{ inputs.kane_folder_id }}")
+          fi
+          kane-cli login "${args[@]}"
 
       - name: Run selected tests as one LambdaTest test run
         # kane-cli testrun run bundles every listed test into a single sealed execution
         # (one LambdaTest Test Run / evidence pack), instead of N separate ad-hoc sessions.
+        # Its NDJSON output never includes a hosted LambdaTest share/dashboard URL (public or
+        # private) - only a local evidence_id, viewable via `kane-cli evidence serve`. Captured
+        # here (not `set -e`'d away on failure) so the summary step below can still parse and
+        # publish results even when one or more tests fail.
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
         run: |
-          set -e
           mapfile -d '' -t test_files < selected_tests.txt
           echo "Running ${#test_files[@]} test(s) as one test run."
-          if ! kane-cli testrun run "${test_files[@]}" \
+          kane-cli testrun run "${test_files[@]}" \
             --headless \
             --on-failure continue \
-            --name "agentic-test-pipeline run ${{ github.run_id }}"; then
-            echo "::warning::One or more tests failed in the test run - see the summary above for per-test status."
+            --name "agentic-test-pipeline run ${{ github.run_id }}" | tee testrun_output.ndjson
+          exit_code=${PIPESTATUS[0]}
+          if [ "$exit_code" -ne 0 ]; then
+            echo "::warning::One or more tests failed in the test run - see the job summary for per-test status."
           fi
 
-      - name: Build view
+      - name: Locate evidence pack for upload
+        if: always()
+        id: evidence
         run: |
-          echo "Results are published as a LambdaTest Test Manager build - see https://test-manager.lambdatest.com/ for the project associated with the authenticated kane-cli/LambdaTest account."
+          execution_id=$(jq -r 'select(.type == "testrun_done") | .execution_id' testrun_output.ndjson | tail -n1)
+          echo "execution_id=$execution_id" >> "$GITHUB_OUTPUT"
+          pack=".testmuai/evidence/$execution_id.evidence"
+          if [ -f "$pack" ]; then
+            mkdir -p evidence-pack
+            cp "$pack" evidence-pack/
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload evidence pack
+        if: always() && steps.evidence.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-run-evidence
+          path: evidence-pack/*.evidence
+          retention-days: 14
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## Agentic Test Pipeline - Execution Summary"
+            echo
+            project="${{ inputs.kane_project_id }}"
+            folder="${{ inputs.kane_folder_id }}"
+            echo "**Project:** ${project:-account default}  "
+            echo "**Folder:** ${folder:-account default}  "
+            echo "**Execution ID:** ${{ steps.evidence.outputs.execution_id }}"
+            echo
+            echo "| Test | Status | Duration (s) |"
+            echo "|---|---|---|"
+            jq -r 'select(.type == "testrun_member_end") | "| \(.path | split("/") | last) | \(.status) | \(.duration_s) |"' testrun_output.ndjson
+            echo
+            jq -r 'select(.type == "testrun_summary") | "**Totals:** \(.totals.passed) passed, \(.totals.failed) failed, \(.totals.broken) broken, \(.totals.skipped) skipped (of \(.totals.tests)) - \(.duration_s)s"' testrun_output.ndjson
+            jq -r 'select(.type == "testrun_done") | "**Overall status:** \(.overall_status)"' testrun_output.ndjson
+            echo
+            if [ "${{ steps.evidence.outputs.found }}" = "true" ]; then
+              echo "**Evidence pack:** uploaded as the \`test-run-evidence\` artifact on this run. Download it and view locally with:"
+              echo '```'
+              echo "kane-cli evidence serve <downloaded-file>.evidence"
+              echo '```'
+            else
+              echo "**Evidence pack:** not found on this runner (upload may have failed or not completed)."
+            fi
+            echo
+            echo "> **Note:** \`kane-cli testrun run\` does not produce a hosted LambdaTest Test Manager link (public or private) - only the local evidence pack above. Per-test dashboard share links require running via \`kane-cli testmd run\` per test instead of the grouped test run."
+          } >> "$GITHUB_STEP_SUMMARY"
