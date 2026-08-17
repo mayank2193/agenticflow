@@ -2,7 +2,8 @@ name: Agentic Test Pipeline
 
 # Generic, reusable 3-stage pipeline - not tied to any specific requirements doc:
 #   1. planner   - read a requirements PDF/DOCX and generate/refresh test cases (kane-cli generate)
-#   2. authoring - export the generated *_test.md files to standalone Playwright code (kane-cli testmd export)
+#   2. authoring - author + export up to max_tests_to_author of the generated *_test.md files as
+#                  standalone Playwright code (kane-cli testmd run --code-export)
 #   3. execution - run the exported Playwright code against LambdaTest and produce a build view
 #
 # Works two ways:
@@ -45,6 +46,11 @@ on:
         options:
           - javascript
           - python
+      max_tests_to_author:
+        description: "Cap on how many planner-generated tests get authored (0 = author all of them)"
+        required: false
+        default: 0
+        type: number
   workflow_call:
     inputs:
       requirements_doc:
@@ -59,6 +65,10 @@ on:
         type: string
         required: false
         default: "javascript"
+      max_tests_to_author:
+        type: number
+        required: false
+        default: 0
     secrets:
       KANE_USERNAME:
         required: true
@@ -154,20 +164,38 @@ jobs:
         run: |
           kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
 
-      - name: Sync each generated test to TMS and export its automation code
+      - name: Select tests to author (respecting max_tests_to_author)
+        id: select
+        run: |
+          set -e
+          mapfile -d '' -t all_tests < <(find .testmuai/tests -name '*_test.md' -print0 | sort -z)
+          total=${#all_tests[@]}
+          max="${{ inputs.max_tests_to_author }}"
+          if [ -n "$max" ] && [ "$max" -gt 0 ] && [ "$max" -lt "$total" ]; then
+            echo "Planner produced $total tests; authoring is capped at $max."
+            selected=("${all_tests[@]:0:$max}")
+          else
+            echo "Planner produced $total tests; authoring all of them (no cap, or cap >= total)."
+            selected=("${all_tests[@]}")
+          fi
+          printf '%s\0' "${selected[@]}" > selected_tests.txt
+          echo "count=${#selected[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync selected tests to TMS and export their automation code
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
         run: |
           set -e
-          find .testmuai/tests -name '*_test.md' -print0 | while IFS= read -r -d '' test_file; do
+          echo "Authoring ${{ steps.select.outputs.count }} test(s)."
+          while IFS= read -r -d '' test_file; do
             echo "Running + exporting: $test_file"
             kane-cli testmd run "$test_file" \
               --headless \
               --agent \
               --code-export \
               --code-language "${{ inputs.test_language }}"
-          done
+          done < selected_tests.txt
 
       - name: Upload exported automation code
         uses: actions/upload-artifact@v4
