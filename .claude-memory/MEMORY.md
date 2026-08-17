@@ -1,0 +1,3 @@
+- [Test-case generation flow](testcase_generation_flow.md) — read doc → kane-cli generate → refine for gaps → flag open questions → table → save; default for all test-creating requests
+- [Airbnb search routing suite](airbnb_search_routing_suite.md) — kane-cli req id 31870, suite path .testmuai/tests/homepage-search-to-results-31870/, NF01 a11y cases not auto-saved
+- [Mirror memory to repo](mirror_memory_to_repo.md) — always copy memory/ writes into E2Erepo/.claude-memory/ so they're visible in the IDE tree

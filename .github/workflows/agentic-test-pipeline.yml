@@ -1,0 +1,123 @@
+name: Agentic Test Pipeline
+
+# Three stages mirroring the local workflow:
+#   1. planner   - read the requirements PDF and generate/refresh test cases (kane-cli generate)
+#   2. authoring - export the generated *_test.md files to standalone Playwright JS code (kane-cli testmd export)
+#   3. execution - run the exported Playwright code against LambdaTest and produce a build view
+#
+# Required repo secrets (Settings > Secrets and variables > Actions):
+#   KANE_USERNAME, KANE_ACCESS_KEY   - kane-cli basic-auth credentials (same as `kane-cli login`)
+#   LT_USERNAME, LT_ACCESS_KEY       - LambdaTest credentials used by the exported Playwright code
+#
+# Manual-only by default (this calls a paid AI generation API in the planner/authoring stages) -
+# trigger it from the Actions tab, or add a push/PR trigger once you're happy with the cost profile.
+
+on:
+  workflow_dispatch:
+    inputs:
+      requirements_pdf:
+        description: "Path to the requirements PDF used by the planner stage"
+        required: false
+        default: "Airbnb_Search_Routing_PRD.pdf"
+
+jobs:
+  planner:
+    name: Planner - Test Creation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install kane-cli
+        run: npm install -g @testmuai/kane-cli@latest
+
+      - name: Authenticate kane-cli
+        run: |
+          kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+
+      - name: Generate/refresh test cases from requirements PDF
+        run: |
+          kane-cli generate "generate test cases for the requirements in the attached document, covering positive, negative, and edge cases for each functional requirement" \
+            --files "${{ inputs.requirements_pdf }}" \
+            --save \
+            --agent
+
+      - name: Upload generated test suite
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-tests
+          path: .testmuai/tests/**/*_test.md
+          retention-days: 14
+
+  authoring:
+    name: Authoring - Playwright Code Generation
+    needs: planner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: generated-tests
+          path: .testmuai/tests
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install kane-cli
+        run: npm install -g @testmuai/kane-cli@latest
+
+      - name: Authenticate kane-cli
+        run: |
+          kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+
+      - name: Export Playwright code for every generated test
+        run: |
+          set -e
+          find .testmuai/tests -name '*_test.md' -print0 | while IFS= read -r -d '' test_file; do
+            echo "Exporting: $test_file"
+            kane-cli testmd export "$test_file" --language javascript --force
+          done
+
+      - name: Upload exported Playwright code
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-code
+          path: .testmuai/tests/**/playwright-javascript-code/**
+          retention-days: 14
+
+  execution:
+    name: Execution - Run on LambdaTest
+    needs: authoring
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: playwright-code
+          path: .testmuai/tests
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run every exported Playwright test on LambdaTest
+        env:
+          LT_USERNAME: ${{ secrets.LT_USERNAME }}
+          LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
+          TESTMU_SMART: "1"
+        run: |
+          set -e
+          find .testmuai/tests -type d -name 'playwright-javascript-code' | while read -r dir; do
+            echo "Running: $dir/test.js"
+            (cd "$dir" && npm install && node test.js)
+          done
+
+      - name: Build view
+        run: |
+          echo "Results are published as a LambdaTest Test Manager build - see https://test-manager.lambdatest.com/ under project 01KVAK4DFBAZVSYN9TEYWWY3WS."
