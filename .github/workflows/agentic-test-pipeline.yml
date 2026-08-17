@@ -94,19 +94,35 @@ jobs:
           if [ -z "$doc" ]; then
             doc=$(find . -maxdepth 2 \( -iname '*.pdf' -o -iname '*.docx' \) | head -n1)
           fi
-          if [ -z "$doc" ] || [ ! -f "$doc" ]; then
+          if [ -z "$doc" ]; then
             echo "::error::No requirements_doc input given and no PDF/DOCX found in repo root." >&2
+            exit 1
+          fi
+          if [ ! -f "$doc" ]; then
+            echo "::error::requirements_doc '$doc' is not a file in the checked-out repo. Pass a path relative to the repo root (e.g. 'Airbnb_Search_Routing_PRD.pdf'), not a github.com URL." >&2
             exit 1
           fi
           echo "Using requirements document: $doc"
           echo "doc=$doc" >> "$GITHUB_OUTPUT"
 
-      - name: Generate/refresh test cases from requirements document
+      - name: Generate test cases from requirements document
+        id: generate
         run: |
-          kane-cli generate "${{ inputs.generation_objective }}" \
+          set -e -o pipefail
+          output=$(kane-cli generate "${{ inputs.generation_objective }}" \
             --files "${{ steps.resolve.outputs.doc }}" \
-            --save \
-            --agent
+            --agent | tee /dev/stderr)
+          req_id=$(printf '%s\n' "$output" | grep '"type":"generate_done"' | grep -o '"request_id":"[0-9]*"' | grep -o '[0-9]*' | tail -n1)
+          if [ -z "$req_id" ]; then
+            echo "::error::Could not find a request_id in kane-cli generate output." >&2
+            exit 1
+          fi
+          echo "Generated request id: $req_id"
+          echo "request_id=$req_id" >> "$GITHUB_OUTPUT"
+
+      - name: Save generated test cases
+        run: |
+          kane-cli generate --save --req "${{ steps.generate.outputs.request_id }}" --agent
 
       - name: Upload generated test suite
         uses: actions/upload-artifact@v4
