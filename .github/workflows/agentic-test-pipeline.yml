@@ -194,6 +194,20 @@ jobs:
           path: .testmuai/tests/**/*_test.md
           retention-days: 14
 
+      - name: Publish planner summary
+        if: always()
+        run: |
+          {
+            echo "## Planner - Test Creation Summary"
+            echo
+            echo "**Requirements document:** \`${{ steps.resolve.outputs.doc }}\`  "
+            echo "**kane-cli request ID:** \`${{ steps.generate.outputs.request_id }}\`"
+            echo
+            echo "Generated \`*_test.md\` files are uploaded as the \`generated-tests\` artifact on this run."
+            echo
+            echo "> A test case only gets a LambdaTest Test Manager link once it's authored/run in the next job - nothing to link to yet at this stage. See the authoring-execution job summary for Test Manager links."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   authoring-execution:
     name: Authoring & Execution - Author, Export, Run on LambdaTest
     needs: planner
@@ -252,19 +266,36 @@ jobs:
           set -e
           echo "Authoring ${{ steps.select.outputs.count }} test(s)."
           failed_count=0
+          : > authoring_links.tsv
           while IFS= read -r -d '' test_file; do
             echo "Running + exporting: $test_file"
+            test_out=$(mktemp)
             # A failed assertion/replay still syncs the test and exports its code
             # (kane-cli just exits non-zero to report the failure) - don't let a
-            # single failing test abort authoring for the rest of the suite.
-            if ! kane-cli testmd run "$test_file" \
+            # single failing test abort authoring for the rest of the suite. Bare
+            # pipeline (no pipefail) so `set -e` sees tee's exit status, not
+            # kane-cli's - failure handling happens explicitly via PIPESTATUS below.
+            kane-cli testmd run "$test_file" \
               --headless \
               --agent \
               --code-export \
-              --code-language "${{ inputs.test_language }}"; then
+              --code-language "${{ inputs.test_language }}" | tee "$test_out"
+            run_status=${PIPESTATUS[0]}
+            if [ "$run_status" -ne 0 ]; then
               echo "::warning::Test failed (assertions or replay) but code was still exported: $test_file"
               failed_count=$((failed_count + 1))
             fi
+            # test_md_done/test_md_summary carry a public share_url when upload succeeded;
+            # the private (login-required) equivalent is the same URL with everything from
+            # /dashboard/share/ onward stripped off.
+            share_url=$(grep -o '"share_url":"[^"]*"' "$test_out" | tail -n1 | sed -E 's/.*:"(.*)"/\1/')
+            testcase_id=$(grep -o '"testcase_id":"[^"]*"' "$test_out" | tail -n1 | sed -E 's/.*:"(.*)"/\1/')
+            private_url=""
+            if [ -n "$share_url" ]; then
+              private_url="${share_url%%/dashboard/share/*}"
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$test_file" "${testcase_id:-N/A}" "${share_url:-N/A}" "${private_url:-N/A}" >> authoring_links.tsv
+            rm -f "$test_out"
           done < selected_tests.txt
           if [ "$failed_count" -gt 0 ]; then
             echo "$failed_count of ${{ steps.select.outputs.count }} test(s) failed during authoring (code was exported for all of them regardless)."
@@ -276,6 +307,28 @@ jobs:
           name: automation-code
           path: .testmuai/tests/**/playwright-${{ inputs.test_language }}-code/**
           retention-days: 14
+
+      - name: Publish authoring summary
+        if: always()
+        run: |
+          {
+            echo "## Authoring - Automation Code Generation Summary"
+            echo
+            echo "Exported automation code (\`${{ inputs.test_language }}\`) is uploaded as the \`automation-code\` artifact on this run."
+            echo
+            echo "| Test | Test Manager (public) | Test Manager (private, login required) |"
+            echo "|---|---|---|"
+            if [ -f authoring_links.tsv ]; then
+              while IFS=$'\t' read -r path testcase_id share_url private_url; do
+                name=$(basename "$path")
+                if [ "$share_url" = "N/A" ]; then
+                  echo "| $name | N/A | N/A |"
+                else
+                  echo "| $name | [open]($share_url) | [open]($private_url) |"
+                fi
+              done < authoring_links.tsv
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run selected tests as one LambdaTest test run
         # kane-cli testrun run bundles every listed test into a single sealed execution
