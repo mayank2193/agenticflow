@@ -4,14 +4,19 @@ name: Agentic Test Pipeline
 #   1. planner   - read a requirements PDF/DOCX and generate/refresh test cases (kane-cli generate)
 #   2. authoring - author + export up to max_tests_to_author of the generated *_test.md files as
 #                  standalone Playwright code (kane-cli testmd run --code-export)
-#   3. execution - re-run the same selected tests against LambdaTest and produce a build view
+#   3. execution - re-run the same selected tests as one bundled LambdaTest test run
+#                  (kane-cli testrun run) and produce a build view
 #
-# Note on execution: it re-runs each *_test.md via `kane-cli testmd run` rather than executing
-# the exported Playwright file directly (e.g. `node test.js`). The exported file hardcodes the
-# tcId/build from its authoring session, and replaying it standalone gets rejected by LambdaTest
-# with "Test case validation failed: bad request" - that combination is only valid inside a fresh
-# kane-cli-managed session, not a bare CDP replay. `kane-cli testmd run` creates a new session each
-# time and is the mechanism proven to actually reach LambdaTest and produce a build/share_url.
+# Note on execution: it re-runs the *_test.md files via `kane-cli testrun run` rather than
+# executing the exported Playwright file directly (e.g. `node test.js`). The exported file
+# hardcodes the tcId/build from its authoring session, and replaying it standalone gets
+# rejected by LambdaTest with "Test case validation failed: bad request" - that combination is
+# only valid inside a fresh kane-cli-managed session, not a bare CDP replay. kane-cli's own
+# testmd/testrun commands create a new session each time and are the mechanism proven to
+# actually reach LambdaTest and produce a build/share_url. `testrun run` additionally requires
+# each member to already have local meta from a prior `testmd run` (else it's skipped as
+# "missing_meta"), which is why authoring's full .testmuai/tests state - not just the bare
+# *_test.md files - is carried forward into this job.
 #
 # Works two ways:
 #   - Directly in this repo: Actions tab > "Agentic Test Pipeline" > Run workflow, optionally
@@ -221,11 +226,19 @@ jobs:
           path: .testmuai/tests/**/playwright-${{ inputs.test_language }}-code/**
           retention-days: 14
 
-      - name: Upload selected tests list
+      - name: Upload authored state for execution
+        # Execution re-runs these tests via `kane-cli testrun run`, which requires each
+        # member to already have local meta (output-<stem>/.internal/meta.json, written by
+        # the testmd run above) - a bare *_test.md is reported as "missing_meta" and skipped.
+        # Ship the whole .testmuai/tests tree (not just the *_test.md files) so that local
+        # state survives into the execution job's fresh checkout.
         uses: actions/upload-artifact@v4
         with:
-          name: selected-tests
-          path: selected_tests.txt
+          name: authored-state
+          path: |
+            .testmuai/tests/**
+            selected_tests.txt
+          include-hidden-files: true
           retention-days: 14
 
   execution:
@@ -237,12 +250,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: generated-tests
-          path: .testmuai/tests
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: selected-tests
+          name: authored-state
           path: .
 
       - uses: actions/setup-node@v4
@@ -256,23 +264,22 @@ jobs:
         run: |
           kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
 
-      - name: Re-run each selected test on LambdaTest
+      - name: Run selected tests as one LambdaTest test run
+        # kane-cli testrun run bundles every listed test into a single sealed execution
+        # (one LambdaTest Test Run / evidence pack), instead of N separate ad-hoc sessions.
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
         run: |
           set -e
-          failed_count=0
-          total=0
-          while IFS= read -r -d '' test_file; do
-            total=$((total + 1))
-            echo "Running: $test_file"
-            if ! kane-cli testmd run "$test_file" --headless --agent; then
-              echo "::warning::Test failed on LambdaTest: $test_file"
-              failed_count=$((failed_count + 1))
-            fi
-          done < selected_tests.txt
-          echo "$((total - failed_count)) of $total test(s) passed on LambdaTest."
+          mapfile -d '' -t test_files < selected_tests.txt
+          echo "Running ${#test_files[@]} test(s) as one test run."
+          if ! kane-cli testrun run "${test_files[@]}" \
+            --headless \
+            --on-failure continue \
+            --name "agentic-test-pipeline run ${{ github.run_id }}"; then
+            echo "::warning::One or more tests failed in the test run - see the summary above for per-test status."
+          fi
 
       - name: Build view
         run: |
