@@ -154,6 +154,17 @@ jobs:
         run: |
           kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
 
+      - name: Sync each generated test to TMS (required before export)
+        env:
+          LT_USERNAME: ${{ secrets.LT_USERNAME }}
+          LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
+        run: |
+          set -e
+          find .testmuai/tests -name '*_test.md' -print0 | while IFS= read -r -d '' test_file; do
+            echo "Running: $test_file"
+            kane-cli testmd run "$test_file"
+          done
+
       - name: Export automation code for every generated test
         run: |
           set -e
