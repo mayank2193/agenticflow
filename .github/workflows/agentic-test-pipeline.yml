@@ -188,14 +188,24 @@ jobs:
         run: |
           set -e
           echo "Authoring ${{ steps.select.outputs.count }} test(s)."
+          failed_count=0
           while IFS= read -r -d '' test_file; do
             echo "Running + exporting: $test_file"
-            kane-cli testmd run "$test_file" \
+            # A failed assertion/replay still syncs the test and exports its code
+            # (kane-cli just exits non-zero to report the failure) - don't let a
+            # single failing test abort authoring for the rest of the suite.
+            if ! kane-cli testmd run "$test_file" \
               --headless \
               --agent \
               --code-export \
-              --code-language "${{ inputs.test_language }}"
+              --code-language "${{ inputs.test_language }}"; then
+              echo "::warning::Test failed (assertions or replay) but code was still exported: $test_file"
+              failed_count=$((failed_count + 1))
+            fi
           done < selected_tests.txt
+          if [ "$failed_count" -gt 0 ]; then
+            echo "$failed_count of ${{ steps.select.outputs.count }} test(s) failed during authoring (code was exported for all of them regardless)."
+          fi
 
       - name: Upload exported automation code
         uses: actions/upload-artifact@v4
