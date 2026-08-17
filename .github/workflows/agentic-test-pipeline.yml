@@ -232,6 +232,7 @@ jobs:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
           TESTMU_SMART: "1"
+          TESTMU_RUN_TARGET: "cloud"
         run: |
           set -e
           find .testmuai/tests -type d -name 'playwright-javascript-code' | while read -r dir; do
@@ -245,6 +246,7 @@ jobs:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
           TESTMU_SMART: "1"
+          TESTMU_RUN_TARGET: "cloud"
         run: |
           set -e
           find .testmuai/tests -type d -name 'playwright-python-code' | while read -r dir; do
