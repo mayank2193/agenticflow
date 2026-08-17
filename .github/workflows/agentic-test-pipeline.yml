@@ -1,11 +1,20 @@
 name: Agentic Test Pipeline
 
-# Generic, reusable 3-stage pipeline - not tied to any specific requirements doc:
-#   1. planner   - read a requirements PDF/DOCX and generate/refresh test cases (kane-cli generate)
-#   2. authoring - author + export up to max_tests_to_author of the generated *_test.md files as
-#                  standalone Playwright code (kane-cli testmd run --code-export)
-#   3. execution - re-run the same selected tests as one bundled LambdaTest test run
-#                  (kane-cli testrun run) and publish a job summary
+# Generic, reusable 2-job pipeline - not tied to any specific requirements doc:
+#   1. planner              - read a requirements PDF/DOCX and generate/refresh test cases
+#                              (kane-cli generate), a separate job/runner from what follows.
+#   2. authoring-execution  - one job covering both remaining stages back to back, in the same
+#                              runner/workspace (no artifact hop between them):
+#       - authoring: author + export up to max_tests_to_author of the generated *_test.md files
+#                    as standalone Playwright code (kane-cli testmd run --code-export)
+#       - execution: re-run the same selected tests as one bundled LambdaTest test run
+#                    (kane-cli testrun run) and publish a job summary
+#
+# Authoring and execution were originally separate jobs, each re-doing checkout/setup-node/
+# install-kane-cli/login and shuttling an "authored-state" artifact between them just to carry
+# forward the local meta testrun needs. Merged into one job to drop that duplication - the
+# meta written by authoring's `testmd run` calls is already on disk when execution's
+# `testrun run` call runs right after, in the same workspace.
 #
 # Note on execution: it re-runs the *_test.md files via `kane-cli testrun run` rather than
 # executing the exported Playwright file directly (e.g. `node test.js`). The exported file
@@ -14,12 +23,11 @@ name: Agentic Test Pipeline
 # only valid inside a fresh kane-cli-managed session, not a bare CDP replay. kane-cli's own
 # testmd/testrun commands create a new session each time and are the mechanism proven to
 # actually reach LambdaTest. `testrun run` additionally requires each member to already have
-# local meta from a prior `testmd run` (else it's skipped as "missing_meta"), which is why
-# authoring's full .testmuai/tests state - not just the bare *_test.md files - is carried
-# forward into this job. IMPORTANT: unlike `testmd run`, `testrun run` never returns a hosted
-# LambdaTest dashboard link (public or private) - only a local evidence pack - so the job
-# summary reports pass/fail per test plus that evidence pack (uploaded as an artifact), not a
-# clickable Test Manager URL.
+# local meta from a prior `testmd run` (else it's skipped as "missing_meta") - satisfied here
+# simply by authoring's steps having already run earlier in the same job. IMPORTANT: unlike
+# `testmd run`, `testrun run` never returns a hosted LambdaTest dashboard link (public or
+# private) - only a local evidence pack - so the job summary reports pass/fail per test plus
+# that evidence pack (uploaded as an artifact), not a clickable Test Manager URL.
 #
 # kane_project_id / kane_folder_id inputs: passed to `kane-cli login --project-id/--folder-id`
 # in every job when set; left blank, kane-cli auto-selects the authenticated account's default
@@ -186,8 +194,8 @@ jobs:
           path: .testmuai/tests/**/*_test.md
           retention-days: 14
 
-  authoring:
-    name: Authoring - Automation Code Generation
+  authoring-execution:
+    name: Authoring & Execution - Author, Export, Run on LambdaTest
     needs: planner
     runs-on: ubuntu-latest
     steps:
@@ -268,54 +276,6 @@ jobs:
           name: automation-code
           path: .testmuai/tests/**/playwright-${{ inputs.test_language }}-code/**
           retention-days: 14
-
-      - name: Upload authored state for execution
-        # Execution re-runs these tests via `kane-cli testrun run`, which requires each
-        # member to already have local meta (output-<stem>/.internal/meta.json, written by
-        # the testmd run above) - a bare *_test.md is reported as "missing_meta" and skipped.
-        # Ship the whole .testmuai/tests tree (not just the *_test.md files) so that local
-        # state survives into the execution job's fresh checkout.
-        uses: actions/upload-artifact@v4
-        with:
-          name: authored-state
-          path: |
-            .testmuai/tests/**
-            selected_tests.txt
-          include-hidden-files: true
-          retention-days: 14
-
-  execution:
-    name: Execution - Run on LambdaTest
-    needs: authoring
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: authored-state
-          path: .
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install kane-cli
-        run: npm install -g @testmuai/kane-cli@latest
-
-      - name: Authenticate kane-cli
-        run: |
-          set -e
-          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
-          # Blank project/folder ID = let kane-cli auto-select the account default (same
-          # as a plain `kane-cli login` with no --project-id/--folder-id).
-          if [ -n "${{ inputs.kane_project_id }}" ]; then
-            args+=(--project-id "${{ inputs.kane_project_id }}")
-          fi
-          if [ -n "${{ inputs.kane_folder_id }}" ]; then
-            args+=(--folder-id "${{ inputs.kane_folder_id }}")
-          fi
-          kane-cli login "${args[@]}"
 
       - name: Run selected tests as one LambdaTest test run
         # kane-cli testrun run bundles every listed test into a single sealed execution
