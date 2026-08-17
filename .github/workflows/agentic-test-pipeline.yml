@@ -1,24 +1,73 @@
 name: Agentic Test Pipeline
 
-# Three stages mirroring the local workflow:
-#   1. planner   - read the requirements PDF and generate/refresh test cases (kane-cli generate)
-#   2. authoring - export the generated *_test.md files to standalone Playwright JS code (kane-cli testmd export)
+# Generic, reusable 3-stage pipeline - not tied to any specific requirements doc:
+#   1. planner   - read a requirements PDF/DOCX and generate/refresh test cases (kane-cli generate)
+#   2. authoring - export the generated *_test.md files to standalone Playwright code (kane-cli testmd export)
 #   3. execution - run the exported Playwright code against LambdaTest and produce a build view
 #
-# Required repo secrets (Settings > Secrets and variables > Actions):
-#   KANE_USERNAME, KANE_ACCESS_KEY   - kane-cli basic-auth credentials (same as `kane-cli login`)
-#   LT_USERNAME, LT_ACCESS_KEY       - LambdaTest credentials used by the exported Playwright code
+# Works two ways:
+#   - Directly in this repo: Actions tab > "Agentic Test Pipeline" > Run workflow, optionally
+#     overriding the inputs below (leave requirements_doc blank to auto-detect the first
+#     PDF/DOCX found in the repo root).
+#   - As a reusable workflow from another workflow in this repo (or any repo that checks this
+#     one out), e.g.:
 #
-# Manual-only by default (this calls a paid AI generation API in the planner/authoring stages) -
-# trigger it from the Actions tab, or add a push/PR trigger once you're happy with the cost profile.
+#       jobs:
+#         tests:
+#           uses: mayank2193/agenticflow/.github/workflows/agentic-test-pipeline.yml@master
+#           with:
+#             requirements_doc: docs/my-new-prd.pdf
+#           secrets: inherit
+#
+# Required secrets (repo Settings > Secrets and variables > Actions, or passed via `secrets: inherit`):
+#   KANE_USERNAME, KANE_ACCESS_KEY   - kane-cli basic-auth credentials (same as `kane-cli login`)
+#   LT_USERNAME, LT_ACCESS_KEY       - LambdaTest credentials used by the exported code
+#
+# Manual-only by default (planner/authoring call a paid AI generation API) - add a push/PR
+# trigger once you're happy with the cost profile for a given repo.
 
 on:
   workflow_dispatch:
     inputs:
-      requirements_pdf:
-        description: "Path to the requirements PDF used by the planner stage"
+      requirements_doc:
+        description: "Path to the requirements PDF/DOCX (blank = auto-detect first one in repo root)"
         required: false
-        default: "Airbnb_Search_Routing_PRD.pdf"
+        default: ""
+      generation_objective:
+        description: "Instruction passed to kane-cli generate"
+        required: false
+        default: "generate test cases for the requirements in the attached document, covering positive, negative, and edge cases for each functional requirement"
+      test_language:
+        description: "Language for the exported automation code"
+        required: false
+        default: "javascript"
+        type: choice
+        options:
+          - javascript
+          - python
+  workflow_call:
+    inputs:
+      requirements_doc:
+        type: string
+        required: false
+        default: ""
+      generation_objective:
+        type: string
+        required: false
+        default: "generate test cases for the requirements in the attached document, covering positive, negative, and edge cases for each functional requirement"
+      test_language:
+        type: string
+        required: false
+        default: "javascript"
+    secrets:
+      KANE_USERNAME:
+        required: true
+      KANE_ACCESS_KEY:
+        required: true
+      LT_USERNAME:
+        required: true
+      LT_ACCESS_KEY:
+        required: true
 
 jobs:
   planner:
@@ -38,10 +87,24 @@ jobs:
         run: |
           kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
 
-      - name: Generate/refresh test cases from requirements PDF
+      - name: Resolve requirements document
+        id: resolve
         run: |
-          kane-cli generate "generate test cases for the requirements in the attached document, covering positive, negative, and edge cases for each functional requirement" \
-            --files "${{ inputs.requirements_pdf }}" \
+          doc="${{ inputs.requirements_doc }}"
+          if [ -z "$doc" ]; then
+            doc=$(find . -maxdepth 2 \( -iname '*.pdf' -o -iname '*.docx' \) | head -n1)
+          fi
+          if [ -z "$doc" ] || [ ! -f "$doc" ]; then
+            echo "::error::No requirements_doc input given and no PDF/DOCX found in repo root." >&2
+            exit 1
+          fi
+          echo "Using requirements document: $doc"
+          echo "doc=$doc" >> "$GITHUB_OUTPUT"
+
+      - name: Generate/refresh test cases from requirements document
+        run: |
+          kane-cli generate "${{ inputs.generation_objective }}" \
+            --files "${{ steps.resolve.outputs.doc }}" \
             --save \
             --agent
 
@@ -53,7 +116,7 @@ jobs:
           retention-days: 14
 
   authoring:
-    name: Authoring - Playwright Code Generation
+    name: Authoring - Automation Code Generation
     needs: planner
     runs-on: ubuntu-latest
     steps:
@@ -75,19 +138,19 @@ jobs:
         run: |
           kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
 
-      - name: Export Playwright code for every generated test
+      - name: Export automation code for every generated test
         run: |
           set -e
           find .testmuai/tests -name '*_test.md' -print0 | while IFS= read -r -d '' test_file; do
             echo "Exporting: $test_file"
-            kane-cli testmd export "$test_file" --language javascript --force
+            kane-cli testmd export "$test_file" --language "${{ inputs.test_language }}" --force
           done
 
-      - name: Upload exported Playwright code
+      - name: Upload exported automation code
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-code
-          path: .testmuai/tests/**/playwright-javascript-code/**
+          name: automation-code
+          path: .testmuai/tests/**/playwright-${{ inputs.test_language }}-code/**
           retention-days: 14
 
   execution:
@@ -99,14 +162,21 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: playwright-code
+          name: automation-code
           path: .testmuai/tests
 
       - uses: actions/setup-node@v4
+        if: ${{ inputs.test_language == 'javascript' }}
         with:
           node-version: "20"
 
-      - name: Run every exported Playwright test on LambdaTest
+      - uses: actions/setup-python@v5
+        if: ${{ inputs.test_language == 'python' }}
+        with:
+          python-version: "3.11"
+
+      - name: Run every exported test on LambdaTest (JavaScript)
+        if: ${{ inputs.test_language == 'javascript' }}
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
@@ -118,6 +188,19 @@ jobs:
             (cd "$dir" && npm install && node test.js)
           done
 
+      - name: Run every exported test on LambdaTest (Python)
+        if: ${{ inputs.test_language == 'python' }}
+        env:
+          LT_USERNAME: ${{ secrets.LT_USERNAME }}
+          LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
+          TESTMU_SMART: "1"
+        run: |
+          set -e
+          find .testmuai/tests -type d -name 'playwright-python-code' | while read -r dir; do
+            echo "Running: $dir/test.py"
+            (cd "$dir" && pip install -r requirements.txt && python3 test.py)
+          done
+
       - name: Build view
         run: |
-          echo "Results are published as a LambdaTest Test Manager build - see https://test-manager.lambdatest.com/ under project 01KVAK4DFBAZVSYN9TEYWWY3WS."
+          echo "Results are published as a LambdaTest Test Manager build - see https://test-manager.lambdatest.com/ for the project associated with the authenticated kane-cli/LambdaTest account."
