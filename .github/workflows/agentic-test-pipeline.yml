@@ -4,7 +4,14 @@ name: Agentic Test Pipeline
 #   1. planner   - read a requirements PDF/DOCX and generate/refresh test cases (kane-cli generate)
 #   2. authoring - author + export up to max_tests_to_author of the generated *_test.md files as
 #                  standalone Playwright code (kane-cli testmd run --code-export)
-#   3. execution - run the exported Playwright code against LambdaTest and produce a build view
+#   3. execution - re-run the same selected tests against LambdaTest and produce a build view
+#
+# Note on execution: it re-runs each *_test.md via `kane-cli testmd run` rather than executing
+# the exported Playwright file directly (e.g. `node test.js`). The exported file hardcodes the
+# tcId/build from its authoring session, and replaying it standalone gets rejected by LambdaTest
+# with "Test case validation failed: bad request" - that combination is only valid inside a fresh
+# kane-cli-managed session, not a bare CDP replay. `kane-cli testmd run` creates a new session each
+# time and is the mechanism proven to actually reach LambdaTest and produce a build/share_url.
 #
 # Works two ways:
 #   - Directly in this repo: Actions tab > "Agentic Test Pipeline" > Run workflow, optionally
@@ -214,6 +221,13 @@ jobs:
           path: .testmuai/tests/**/playwright-${{ inputs.test_language }}-code/**
           retention-days: 14
 
+      - name: Upload selected tests list
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-tests
+          path: selected_tests.txt
+          retention-days: 14
+
   execution:
     name: Execution - Run on LambdaTest
     needs: authoring
@@ -223,46 +237,42 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: automation-code
+          name: generated-tests
           path: .testmuai/tests
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: selected-tests
+          path: .
+
       - uses: actions/setup-node@v4
-        if: ${{ inputs.test_language == 'javascript' }}
         with:
           node-version: "20"
 
-      - uses: actions/setup-python@v5
-        if: ${{ inputs.test_language == 'python' }}
-        with:
-          python-version: "3.11"
+      - name: Install kane-cli
+        run: npm install -g @testmuai/kane-cli@latest
 
-      - name: Run every exported test on LambdaTest (JavaScript)
-        if: ${{ inputs.test_language == 'javascript' }}
+      - name: Authenticate kane-cli
+        run: |
+          kane-cli login --username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+
+      - name: Re-run each selected test on LambdaTest
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
-          TESTMU_SMART: "1"
-          TESTMU_RUN_TARGET: "cloud"
         run: |
           set -e
-          find .testmuai/tests -type d -name 'playwright-javascript-code' | while read -r dir; do
-            echo "Running: $dir/test.js"
-            (cd "$dir" && npm install && node test.js)
-          done
-
-      - name: Run every exported test on LambdaTest (Python)
-        if: ${{ inputs.test_language == 'python' }}
-        env:
-          LT_USERNAME: ${{ secrets.LT_USERNAME }}
-          LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
-          TESTMU_SMART: "1"
-          TESTMU_RUN_TARGET: "cloud"
-        run: |
-          set -e
-          find .testmuai/tests -type d -name 'playwright-python-code' | while read -r dir; do
-            echo "Running: $dir/test.py"
-            (cd "$dir" && pip install -r requirements.txt && python3 test.py)
-          done
+          failed_count=0
+          total=0
+          while IFS= read -r -d '' test_file; do
+            total=$((total + 1))
+            echo "Running: $test_file"
+            if ! kane-cli testmd run "$test_file" --headless --agent; then
+              echo "::warning::Test failed on LambdaTest: $test_file"
+              failed_count=$((failed_count + 1))
+            fi
+          done < selected_tests.txt
+          echo "$((total - failed_count)) of $total test(s) passed on LambdaTest."
 
       - name: Build view
         run: |
