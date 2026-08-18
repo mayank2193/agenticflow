@@ -15,6 +15,48 @@ The workflow (`.github/workflows/agentic-test-pipeline.yml`) has 2 jobs:
 
 Every job publishes a **GitHub Actions job summary** (visible on the run page) and uploads artifacts you can download from the run.
 
+```mermaid
+flowchart TD
+    doc["📄 Requirements doc<br/>(PDF / DOCX)"]
+
+    subgraph job1["Job 1 · planner"]
+        gen["kane-cli generate<br/>(positive / negative / edge cases)"]
+        save["kane-cli generate --save"]
+        gen --> save
+    end
+
+    subgraph job2["Job 2 · authoring-execution (same runner)"]
+        direction TB
+        select["Select tests<br/>(respects max_tests_to_author)"]
+        subgraph authoring["Authoring — per test"]
+            run1["kane-cli testmd run<br/>--code-export"]
+        end
+        subgraph execution["Execution — one bundled run"]
+            run2["kane-cli testrun run<br/>(all selected tests)"]
+        end
+        select --> authoring --> execution
+    end
+
+    artTests[("🗂️ generated-tests<br/>artifact")]
+    artCode[("🗂️ automation-code<br/>artifact")]
+    artEvidence[("🗂️ test-run-evidence<br/>artifact")]
+    sumPlanner["📋 Planner summary"]
+    sumAuth["📋 Authoring summary<br/>public + private TM links"]
+    sumExec["📋 Execution summary<br/>pass/fail per test"]
+    lt["☁️ LambdaTest<br/>Test Manager"]
+
+    doc --> gen
+    save --> artTests
+    save --> sumPlanner
+    artTests --> select
+    run1 --> artCode
+    run1 --> sumAuth
+    run1 -. syncs .-> lt
+    run2 --> artEvidence
+    run2 --> sumExec
+    run2 -. runs on .-> lt
+```
+
 ## One-time setup
 
 ### 1. Add repository secrets
