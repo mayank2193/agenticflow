@@ -352,11 +352,19 @@ jobs:
             echo "::warning::One or more tests failed in the test run - see the job summary for per-test status."
           fi
 
+      - name: Filter testrun output to pure NDJSON
+        # kane-cli prints a plain-text "Update available: ..." banner (and sometimes blank
+        # lines) to stdout before its NDJSON events - jq errors out on that non-JSON line if
+        # fed the raw capture. Every downstream jq consumer reads this filtered file instead.
+        if: always()
+        run: |
+          grep '^{' testrun_output.ndjson > testrun_events.ndjson || true
+
       - name: Locate evidence pack for upload
         if: always()
         id: evidence
         run: |
-          execution_id=$(jq -r 'select(.type == "testrun_done") | .execution_id' testrun_output.ndjson | tail -n1)
+          execution_id=$(jq -r 'select(.type == "testrun_done") | .execution_id' testrun_events.ndjson | tail -n1)
           echo "execution_id=$execution_id" >> "$GITHUB_OUTPUT"
           pack=".testmuai/evidence/$execution_id.evidence"
           if [ -f "$pack" ]; then
@@ -375,6 +383,95 @@ jobs:
           path: evidence-pack/*.evidence
           retention-days: 14
 
+      - name: Create linked Test Manager run and record results
+        # kane-cli's own testmd/testrun commands have no flag to attach to a pre-created TMS
+        # run, so this is a separate integration bolted on after the fact via the raw REST API
+        # (not natively linked to kane-cli's execution - two systems stitched together here):
+        #   1. POST /test-run to create an empty run in the resolved project.
+        #   2. PUT /test-run/{id} with test_run_instances:[{test_case_id,...}] to attach every
+        #      testcase_id authoring captured - the create endpoint's own test_run_instances/
+        #      test_case_ids fields were tested directly against the real API and do NOT
+        #      attach cases despite what the create-test-run doc's example implies; only this
+        #      update-by-id call actually does (verified with real API calls before shipping).
+        #   3. GET /test-run/instances/{id} to map test_case_id -> instance_id.
+        #   4. PUT /test-run/instance/{instance_id} per test to record its Passed/Failed/
+        #      Skipped status. Matched by test file BASENAME, not by
+        #      testrun_member_end.test_id - that field is a different kane-cli-internal id
+        #      (e.g. "be15af12-...", a build/session id), NOT the TMS test_case_id ULID
+        #      (e.g. "01M07V0X..."); confirmed they don't match by testing against the real
+        #      API before shipping. The file basename is the only value common to both
+        #      authoring_links.tsv and testrun_events.ndjson's per-member path.
+        if: always()
+        id: tms
+        run: |
+          set -e
+          # -w0 disables line-wrapping (GNU coreutils, present on the ubuntu-latest runner) -
+          # a wrapped/multi-line value here would corrupt the Authorization header.
+          auth=$(printf '%s:%s' "${{ secrets.KANE_USERNAME }}" "${{ secrets.KANE_ACCESS_KEY }}" | base64 -w0)
+          api="https://test-manager-api.lambdatest.com/api/v1"
+          project="${{ inputs.kane_project_id }}"
+          if [ -z "$project" ]; then
+            project=$(kane-cli config show --agent | jq -r '.project_id')
+          fi
+          title="agentic-test-pipeline run ${{ github.run_id }}"
+
+          create_resp=$(curl -sf -X POST "$api/test-run" \
+            -H "Authorization: Basic $auth" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg t "$title" --arg p "$project" \
+              '{title:$t, objective:"Automated run bundled via kane-cli testrun run", project_id:$p, tags:["agentic-test-pipeline"], test_run_instances: [], is_auteur_generated: true}')")
+          run_id=$(echo "$create_resp" | jq -r '.id // empty')
+          if [ -z "$run_id" ]; then
+            echo "::warning::Failed to create Test Manager run: $create_resp"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+          if [ -f authoring_links.tsv ]; then
+            instances_json=$(awk -F'\t' '$2 != "N/A" {print $2}' authoring_links.tsv | jq -R -s -c 'split("\n") | map(select(length > 0)) | map({test_case_id: .})')
+          else
+            instances_json='[]'
+          fi
+          attach_resp=$(curl -sf -X PUT "$api/test-run/$run_id" \
+            -H "Authorization: Basic $auth" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg id "$run_id" --arg t "$title" --arg p "$project" --argjson instances "$instances_json" \
+              '{id:$id, title:$t, objective:"Automated run bundled via kane-cli testrun run", project_id:$p, tags:["agentic-test-pipeline"], is_auteur_generated:true, type:"Manual", test_run_instances:$instances}')")
+          if ! echo "$attach_resp" | jq -e '.type == "Success"' > /dev/null 2>&1; then
+            echo "::warning::Failed to attach test cases to Test Manager run $run_id: $attach_resp"
+          fi
+
+          curl -sf "$api/test-run/instances/$run_id" -H "Authorization: Basic $auth" \
+            | jq -r '.test_run_instances.data[] | "\(.test_case_id)\t\(.id)"' > tc_to_instance.tsv || true
+
+          : > name_to_testcase.tsv
+          if [ -f authoring_links.tsv ]; then
+            while IFS=$'\t' read -r test_file testcase_id _share _private; do
+              [ "$testcase_id" = "N/A" ] && continue
+              printf '%s\t%s\n' "$(basename "$test_file")" "$testcase_id" >> name_to_testcase.tsv
+            done < authoring_links.tsv
+          fi
+
+          if [ -s tc_to_instance.tsv ] && [ -f testrun_events.ndjson ]; then
+            jq -r 'select(.type == "testrun_member_end") | "\(.path)\t\(.status)"' testrun_events.ndjson | \
+            while IFS=$'\t' read -r ev_path test_status; do
+              name=$(basename "$ev_path")
+              testcase_id=$(awk -F'\t' -v n="$name" '$1==n {print $2}' name_to_testcase.tsv)
+              instance_id=$(awk -F'\t' -v tid="$testcase_id" '$1==tid {print $2}' tc_to_instance.tsv)
+              [ -z "$instance_id" ] && continue
+              case "$test_status" in
+                passed) tms_status="Passed" ;;
+                failed|broken|interrupted) tms_status="Failed" ;;
+                skipped) tms_status="Skipped" ;;
+                *) tms_status="Failed" ;;
+              esac
+              curl -sf -X PUT "$api/test-run/instance/$instance_id" \
+                -H "Authorization: Basic $auth" -H "Content-Type: application/json" \
+                -d "$(jq -n --arg s "$tms_status" '{status:$s}')" > /dev/null || \
+                echo "::warning::Failed to record status for $name (testcase $testcase_id, instance $instance_id)"
+            done
+          fi
+
       - name: Publish summary
         if: always()
         run: |
@@ -389,10 +486,10 @@ jobs:
             echo
             echo "| Test | Status | Duration (s) |"
             echo "|---|---|---|"
-            jq -r 'select(.type == "testrun_member_end") | "| \(.path | split("/") | last) | \(.status) | \(.duration_s) |"' testrun_output.ndjson
+            jq -r 'select(.type == "testrun_member_end") | "| \(.path | split("/") | last) | \(.status) | \(.duration_s) |"' testrun_events.ndjson
             echo
-            jq -r 'select(.type == "testrun_summary") | "**Totals:** \(.totals.passed) passed, \(.totals.failed) failed, \(.totals.broken) broken, \(.totals.skipped) skipped (of \(.totals.tests)) - \(.duration_s)s"' testrun_output.ndjson
-            jq -r 'select(.type == "testrun_done") | "**Overall status:** \(.overall_status)"' testrun_output.ndjson
+            jq -r 'select(.type == "testrun_summary") | "**Totals:** \(.totals.passed) passed, \(.totals.failed) failed, \(.totals.broken) broken, \(.totals.skipped) skipped (of \(.totals.tests)) - \(.duration_s)s"' testrun_events.ndjson
+            jq -r 'select(.type == "testrun_done") | "**Overall status:** \(.overall_status)"' testrun_events.ndjson
             echo
             if [ "${{ steps.evidence.outputs.found }}" = "true" ]; then
               echo "**Evidence pack:** uploaded as the \`test-run-evidence\` artifact on this run. Download it and view locally with:"
@@ -403,5 +500,11 @@ jobs:
               echo "**Evidence pack:** not found on this runner (upload may have failed or not completed)."
             fi
             echo
-            echo "> **Note:** \`kane-cli testrun run\` does not produce a hosted LambdaTest Test Manager link (public or private) - only the local evidence pack above. Per-test dashboard share links require running via \`kane-cli testmd run\` per test instead of the grouped test run."
+            if [ "${{ steps.tms.outputs.created }}" = "true" ]; then
+              echo "**Test Manager run:** \`${{ steps.tms.outputs.run_id }}\` - created and populated with every authored test case's result via the REST API (kane-cli itself has no way to attach to a pre-created run, so this is stitched together separately from the \`testrun run\` execution above)."
+            else
+              echo "**Test Manager run:** not created (see warnings above)."
+            fi
+            echo
+            echo "> **Note:** \`kane-cli testrun run\` itself does not produce a hosted LambdaTest Test Manager link (public or private) for the bundled execution - only the local evidence pack above. Per-test dashboard share links come from the authoring stage's summary. The Test Manager run created here is a separate record for visibility, not something kane-cli natively populated."
           } >> "$GITHUB_STEP_SUMMARY"
